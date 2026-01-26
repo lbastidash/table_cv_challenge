@@ -28,23 +28,54 @@ The program outputs bounding boxes for:
   `table`, `header`, `rows`, `columns`, `cells`
 * **Image artifact:** annotated output image (e.g. `output.png`) written to disk
 
-## Quick start (evaluator friendly)
+# Environment Setup and Installation
 
-### Requirements
+This project is implemented in Python and relies on OpenCV and YOLO (Ultralytics) for table detection and processing. Follow the steps below to set up a clean environment and run the project.
 
-* Python 3.8+
-* pip
+# 1. Clone the Repository
+```bash
+git clone https://github.com/lbastidash/table_cv_challenge.git
+cd table_cv_challenge
+```
 
-Install dependencies:
+# 2. Upgrade pip
+pip install --upgrade pip
+
+# 3. Install Project Dependencies
 
 ```bash
-pip install -r requiretments.txt
+pip install -r requirements.txt
 ```
+
+# 4. Install PyTorch (Required by Ultralytics / YOLO)
+
+Ultralytics depends on PyTorch. It is recommended to install PyTorch explicitly to ensure compatibility with your system (CPU or GPU).
+
+Use the official PyTorch selector to get the correct command for your platform and CUDA version:
+
+https://pytorch.org/get-started/locally/
+
+Example (CPU-only installation)
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+```
+
+If you plan to use GPU acceleration, install the CUDA-enabled version recommended by the PyTorch website.
+
+
+# 5. Run the Project
+
+From the root directory, execute:
+
+```bash
+python src/main.py <screenshot_image> <prototype_image> --debug
+```
+
 
 ### Run
 
 ```bash
-python src/main.py /path/to/screenshot.png /path/to/prototype.png
+python src/main.py /path/to/screenshot.png /path/to/prototype.png --debug
 ```
 
 ### Expected output
