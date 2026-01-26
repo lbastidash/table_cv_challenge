@@ -128,11 +128,11 @@ def yolo_propose_many(
     # sliding windows if image large
     if max(h,w) > 1200:
         if mode == "SAP":
-            # SAP: tablas altas, detecciones parciales → más solapamiento
+            # SAP: 
             win = int(min(h, w) * 0.4)
             stride = int(win * 0.33)
         else:
-            # WEB: tablas compactas → menos solapamiento
+            # WEB:
             win = int(min(h, w) * 0.5)
             stride = int(win * 0.5)
         for y in range(0, h-win+1, stride):
@@ -207,7 +207,6 @@ def detect_table_and_header(image, proto_features, conf=CONF_DEFAULT, iou=IOU_DE
     proposals = yolo_propose_many(
         model, image, conf=conf, iou=iou, mode=mode, debug=debug
     )
-
 
     # separate by class name if possible
     names = model.names if hasattr(model, "names") else {}
