@@ -1,0 +1,6 @@
+class_name: table
+bbox: (30, 403, 2322, 1599)
+header_rel: (0, 0, 2292, 418)
+nrows: 53
+ncols: 18
+score: -123.0
