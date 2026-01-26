@@ -16,7 +16,7 @@ def main(screenshot_path, prototype_path, output_path="output.png", debug=False)
     if prototype is None:
         raise FileNotFoundError(f"Prototype not found: {prototype_path}")
 
-    proto_features = extract_prototype_features(prototype, debug=debug)
+    proto_features = extract_prototype_features(prototype, proto_path=prototype_path, debug=debug)
 
     # detect_table_and_header devuelve table_bbox, header_bbox, rows_abs, columns_abs
     table_bbox, header_bbox, rows_abs, columns_abs = detect_table_and_header(
