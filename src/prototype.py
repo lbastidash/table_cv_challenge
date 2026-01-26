@@ -1,43 +1,41 @@
 # src/prototype.py
 import cv2
 import numpy as np
-from column_consistency import detect_column_peaks
+from structural_proposals import detect_columns_by_consistency, detect_header_by_projection, detect_rows_by_structure
 
-def extract_prototype_features(proto_img, debug=False):
-    """
-    Extrae: mode (SAP/WEB), height, width, text_density, proto_col_count.
-    mode:
-      - SAP: si detect_column_peaks >= 3 (columnas claras)
-      - WEB: si text density alto y proto_col_count bajo/indeterminado
-    """
-    gray = cv2.cvtColor(proto_img, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
+def extract_prototype_features(proto_img, proto_name="", debug=False):
 
-    # binarizar suave para estimar presencia de texto
-    bw = cv2.adaptiveThreshold(gray, 255,
-                               cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY_INV, 21, 5)
+    h, w = proto_img.shape[:2]
 
-    text_density = float(bw.sum()) / (255.0 * bw.size) * 100.0  # porcentaje aproximado
+    # asumimos toda la imagen como tabla
+    table = proto_img.copy()
 
-    # contar columnas en prototype
-    cols = detect_column_peaks(proto_img, debug=debug)
-    proto_col_count = len(cols)
+    # columnas por proyección vertical
+    cols = detect_columns_by_consistency(table, debug=debug)
+    col_widths = [c2 - c1 for c1, c2 in cols]
 
-    # heurística: si hay 3+ columnas visuales => SAP-like (column alignment strong)
-    if proto_col_count >= 3:
-        mode = "SAP"
-    else:
-        # si mucho texto => WEB
-        mode = "WEB" if text_density > 5.0 else "SAP"
+    # header + filas
+    header = detect_header_by_projection(table, debug=debug)
+    header_end = header[3] if header else int(0.15 * h)
 
-    if debug:
-        print(f"[prototype] text_density={text_density:.3f} proto_col_count={proto_col_count} mode={mode}")
+    rows = detect_rows_by_structure(table, header_end_rel=header_end, debug=debug)
+    row_heights = [r2 - r1 for r1, r2 in rows]
 
-    return {
-        "mode": mode,
-        "height": h,
-        "width": w,
-        "text_density": text_density,
-        "proto_col_count": proto_col_count
+    # estadísticas robustas
+    proto_features = {
+        "proto_width": w,
+        "proto_height": h,
+        "median_col_width": np.median(col_widths) if col_widths else None,
+        "median_row_height": np.median(row_heights) if row_heights else None,
+        "ncols": len(cols),
+        "nrows": len(rows),
     }
+
+    # modo por nombre (por ahora)
+    name = proto_name.lower()
+    if "sap" in name:
+        proto_features["mode"] = "SAP"
+    else:
+        proto_features["mode"] = "WEB"
+
+    return proto_features

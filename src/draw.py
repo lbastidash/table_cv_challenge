@@ -14,14 +14,30 @@ def draw_results(image, table_bbox, header_bbox=None, rows=None, columns=None):
 
     # rows amarillo
     if rows:
-        for r in rows:
-            rx1, ry1, rx2, ry2 = map(int, r)
-            cv2.rectangle(out, (rx1, ry1), (rx2, ry2), (0,255,255), 1)
+        # rows: [(y1, y2), ...] RELATIVOS a la tabla
+        tx1, ty1, tx2, ty2 = table_bbox
+
+        for (ry1, ry2) in rows:
+            y1 = int(ty1 + ry1)
+            y2 = int(ty1 + ry2)
+            cv2.rectangle(
+                out,
+                (int(tx1), y1),
+                (int(tx2), y2),
+                (0, 255, 255),
+                2
+            )
 
     # columns negras (líneas)
     if columns:
-        for cx in columns:
-            cx = int(cx)
-            cv2.line(out, (cx, y1), (cx, y2), (0,0,0), 2)
-
+        for (cx1, cx2) in columns:
+            x1 = int(tx1 + cx1)
+            x2 = int(tx1 + cx2)
+            cv2.line(
+                out,
+                (x1, int(ty1)),
+                (x1, int(ty2)),
+                (0, 0, 0),
+                2
+            )
     return out

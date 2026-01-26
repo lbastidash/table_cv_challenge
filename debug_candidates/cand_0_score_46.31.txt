@@ -1,8 +1,0 @@
-mode: SAP
-bbox: (18, 1025, 1865, 1080)
-nrows: 2
-ncols: 13
-height_ratio: 0.051
-width_ratio: 0.962
-header_ratio: 0.255
-score: 46.310

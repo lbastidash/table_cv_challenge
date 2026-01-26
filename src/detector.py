@@ -1,212 +1,336 @@
 # src/detector.py
 import os
+import math
 import cv2
 import numpy as np
 from ultralytics import YOLO
+from sklearn.cluster import DBSCAN
 
-from header_detector import detect_header
-from row_text import detect_rows_by_text
-from row_structure import detect_rows_by_structure
-from column_consistency import detect_column_peaks
-from structural_proposals import generate_structural_candidates
+from structural_proposals import propose_structural_candidates, detect_columns_by_consistency, detect_rows_by_structure, detect_header_by_projection
 
-MODEL_PATH = "models/table-detection-and-extraction.pt"
-
-
-# src/detector.py
+MODEL_PATH = "models/table-detection-and-extraction.pt"  # tu modelo HF
 DEBUG_DIR = "debug_candidates"
+CONF_DEFAULT = 0.30
+IOU_DEFAULT = 0.45
 
-_model = None
+# ---- util IoU ----
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    if xB<=xA or yB<=yA:
+        return 0.0
+    inter = (xB-xA)*(yB-yA)
+    union = (boxA[2]-boxA[0])*(boxA[3]-boxA[1]) + (boxB[2]-boxB[0])*(boxB[3]-boxB[1]) - inter
+    return inter/union if union>0 else 0.0
 
-def _load_model():
-    global _model
-    if _model is None:
-        _model = YOLO(MODEL_PATH)
-    return _model
+# ---- merge IoU-based ----
+def merge_boxes_iou(boxes, iou_thresh=0.3):
+    if len(boxes)==0:
+        return []
+    used = [False]*len(boxes)
+    merged = []
+    for i, b in enumerate(boxes):
+        if used[i]:
+            continue
+        bx = np.array(b, dtype=float)
+        used[i]=True
+        # grow by merging overlapping boxes
+        changed = True
+        while changed:
+            changed=False
+            for j, c in enumerate(boxes):
+                if used[j]: continue
+                if iou(bx, c) > iou_thresh:
+                    # merge by taking min x1,y1 and max x2,y2
+                    bx = np.array([min(bx[0], c[0]), min(bx[1], c[1]), max(bx[2], c[2]), max(bx[3], c[3])], dtype=float)
+                    used[j]=True
+                    changed=True
+        merged.append(tuple(map(int,bx.tolist())))
+    return merged
 
-
-def detect_table_and_header(image, proto_features, conf=0.25, debug=False):
+# ---- cluster cell boxes into table candidates ----
+def cluster_cells_to_tables(cell_boxes, eps_pixels=80, min_samples=3):
     """
-    Returns:
-        table_bbox: (x1,y1,x2,y2)
-        header_bbox: (x1,y1,x2,y2)
-        rows_abs: list[(x1,y1,x2,y2)]
-        columns_abs: list[x positions]
+    cell_boxes: Nx4 array
+    returns list of candidate bboxes (x1,y1,x2,y2)
     """
-    model = _load_model()
-    results = model(image, conf=conf)[0]
+    if len(cell_boxes)==0:
+        return []
+    centers = np.array([[(b[0]+b[2])/2.0, (b[1]+b[3])/2.0] for b in cell_boxes])
+    # eps in pixels; if image large, increase eps
+    clustering = DBSCAN(eps=eps_pixels, min_samples=min_samples).fit(centers)
+    labels = clustering.labels_
+    candidates=[]
+    for lab in set(labels):
+        if lab==-1: continue
+        group_idx = np.where(labels==lab)[0]
+        group_boxes = np.array(cell_boxes)[group_idx]
+        x1 = int(group_boxes[:,0].min())
+        y1 = int(group_boxes[:,1].min())
+        x2 = int(group_boxes[:,2].max())
+        y2 = int(group_boxes[:,3].max())
+        candidates.append((x1,y1,x2,y2))
+    return candidates
 
-    img_h, img_w = image.shape[:2]
-    candidates = []
-
-    if debug:
-        os.makedirs(DEBUG_DIR, exist_ok=True)
-
-    # ------------------------------------------------------------
-    # 1. Collect YOLO candidates
-    # ------------------------------------------------------------
-    yolo_boxes = []
-    names = model.names if hasattr(model, "names") else {}
-
-    for box in results.boxes:
-        cls_id = int(box.cls[0])
-        class_name = (
-            names.get(cls_id, str(cls_id))
-            if isinstance(names, dict)
-            else names[cls_id]
-        )
-        if "table" not in class_name.lower():
+# ---- run YOLO at multiple scales + sliding windows ----
+def yolo_propose_many(
+    model,
+    image,
+    conf=CONF_DEFAULT,
+    iou=IOU_DEFAULT,
+    mode="WEB",
+    debug=False
+):
+    """
+    Returns list of (x1,y1,x2,y2, class_id, conf)
+    Strategy:
+      - run once on full image (default)
+      - run on resized scales (0.5, 1.0, 1.5)
+      - run sliding windows (overlap 50%) at medium scale if image big
+    """
+    h,w = image.shape[:2]
+    proposals=[]
+    scales = [1.0, 0.75, 1.25]  # try a few
+    for s in scales:
+        new_h = int(h*s); new_w = int(w*s)
+        try:
+            res = model.predict(image, imgsz=(new_w,new_h), conf=conf, iou=iou, verbose=False)
+        except Exception:
+            # fallback to single call
+            res = model(image, conf=conf, iou=iou)
+        if len(res)==0:
             continue
-
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(img_w, x2), min(img_h, y2)
-
-        if (x2 - x1) > img_w * 0.2:
-            yolo_boxes.append((x1, y1, x2, y2))
-
-    # ------------------------------------------------------------
-    # 2. Fallback: add structural proposals if YOLO is weak
-    # ------------------------------------------------------------
-    if len(yolo_boxes) < 2:
-        if debug:
-            print("[detector] YOLO returned few candidates, adding structural proposals")
-        structural_boxes = generate_structural_candidates(
-            image, proto_features, debug=debug
-        )
-        yolo_boxes.extend(structural_boxes)
-
-    # ------------------------------------------------------------
-    # 3. Evaluate each candidate
-    # ------------------------------------------------------------
-    for idx, (x1, y1, x2, y2) in enumerate(yolo_boxes):
-        crop = image[y1:y2, x1:x2]
-        if crop.size == 0:
-            continue
-
-        mode = proto_features.get("mode", "WEB")
-
-        # -------------------------
-        # Header detection (mandatory)
-        # -------------------------
-        header_rel = detect_header(crop, debug=debug)
-        if header_rel is None:
-            if debug:
-                print(f"[detector] candidate {idx} rejected: no header")
-            continue
-
-        hx1, hy1, hx2, hy2 = header_rel
-        header_abs = (x1 + hx1, y1 + hy1, x1 + hx2, y1 + hy2)
-        header_end_rel = hy2
-
-        # -------------------------
-        # Row detection
-        # -------------------------
+        r = res[0]
+        # boxes in res[0].boxes.xyxy
+        try:
+            boxes = r.boxes.xyxy.cpu().numpy()
+            cls = r.boxes.cls.cpu().numpy().astype(int)
+            scores = r.boxes.conf.cpu().numpy()
+        except Exception:
+            # older / different API shapes
+            boxes = np.array(r.boxes.xyxy)
+            cls = np.array(r.boxes.cls).astype(int)
+            scores = np.array(r.boxes.conf)
+        # map boxes back to original image if scale changed
+        if s!=1.0:
+            inv_s = 1.0/s
+            boxes = boxes * inv_s
+        for b, c_id, sc in zip(boxes, cls, scores):
+            x1,y1,x2,y2 = map(int,b.tolist())
+            # clamp
+            x1 = max(0, min(x1,w-1)); x2 = max(0, min(x2,w-1))
+            y1 = max(0, min(y1,h-1)); y2 = max(0, min(y2,h-1))
+            if x2-x1<4 or y2-y1<4: 
+                continue
+            proposals.append((x1,y1,x2,y2,int(c_id), float(sc)))
+    # sliding windows if image large
+    if max(h,w) > 1200:
         if mode == "SAP":
-            rows_rel = detect_rows_by_structure(crop, header_end_rel, debug=debug)
+            # SAP: tablas altas, detecciones parciales → más solapamiento
+            win = int(min(h, w) * 0.4)
+            stride = int(win * 0.33)
         else:
-            rows_rel = detect_rows_by_text(crop, debug=debug)
+            # WEB: tablas compactas → menos solapamiento
+            win = int(min(h, w) * 0.5)
+            stride = int(win * 0.5)
+        for y in range(0, h-win+1, stride):
+            for x in range(0, w-win+1, stride):
+                crop = image[y:y+win, x:x+win]
+                try:
+                    res = model.predict(crop, imgsz=(win,win), conf=max(conf*0.7,0.2), iou=iou, verbose=False)
+                except Exception:
+                    res = model(crop, conf=max(conf*0.7,0.2), iou=iou)
+                if len(res)==0: continue
+                r = res[0]
+                try:
+                    boxes = r.boxes.xyxy.cpu().numpy()
+                    cls = r.boxes.cls.cpu().numpy().astype(int)
+                    scores = r.boxes.conf.cpu().numpy()
+                except Exception:
+                    boxes = np.array(r.boxes.xyxy)
+                    cls = np.array(r.boxes.cls).astype(int)
+                    scores = np.array(r.boxes.conf)
+                for b, c_id, sc in zip(boxes, cls, scores):
+                    bx1,by1,bx2,by2 = 0,0,0,0  # placeholder
+                    x1b = int(b[0])+x; y1b = int(b[1])+y; x2b = int(b[2])+x; y2b = int(b[3])+y
+                    if x2b-x1b<4 or y2b-y1b<4: continue
+                    proposals.append((x1b,y1b,x2b,y2b,int(c_id),float(sc)))
+    # deduplicate by merging IoU>0.9 identicals
+    final=[]
+    for p in proposals:
+        added=False
+        for i,q in enumerate(final):
+            if box_iou(p[:4], q[:4])>0.9:
+                # keep higher score
+                if p[5] > q[5]:
+                    final[i]=p
+                added=True
+                break
+        if not added:
+            final.append(p)
+    return final
 
-        rows_abs = [
-            (x1, y1 + r0, x2, y1 + r1)
-            for (r0, r1) in rows_rel
+def box_iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    interArea = interW * interH
+
+    areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+
+    if min(areaA, areaB) == 0:
+        return 0.0
+
+    return interArea / min(areaA, areaB)
+
+# ---- main detection function ----
+def detect_table_and_header(image, proto_features, conf=CONF_DEFAULT, iou=IOU_DEFAULT, debug=False):
+    """
+    New detector:
+      - get many proposals via yolo_propose_many (tables, cells)
+      - if cell/row boxes exist, cluster them to produce table candidates
+      - merge all proposals and structural fallbacks, score, pick best
+      - return (table_bbox, header_bbox, rows_abs, cols_abs)
+    """
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    model = YOLO(MODEL_PATH)
+
+    h,w = image.shape[:2]
+    mode = proto_features.get("mode", "WEB") if proto_features else "WEB"
+    proposals = yolo_propose_many(
+        model, image, conf=conf, iou=iou, mode=mode, debug=debug
+    )
+
+
+    # separate by class name if possible
+    names = model.names if hasattr(model, "names") else {}
+    table_boxes=[]
+    cell_boxes=[]
+    row_boxes=[]
+    for (x1,y1,x2,y2,cid,score) in proposals:
+        cname = names.get(cid, str(cid)).lower() if names else str(cid)
+        if "table" in cname and "cell" not in cname:
+            table_boxes.append((x1,y1,x2,y2,score))
+        elif "cell" in cname or "table cell" in cname or "table_cell" in cname:
+            cell_boxes.append((x1,y1,x2,y2))
+        elif "row" in cname:
+            row_boxes.append((x1,y1,x2,y2))
+
+    # if many cell boxes -> cluster them into candidate tables
+    cluster_candidates=[]
+    if len(cell_boxes)>0:
+        cluster_candidates = cluster_cells_to_tables(cell_boxes, eps_pixels=max(30,int(min(h,w)*0.03)), min_samples=3)
+
+    # Merge YOLO table boxes with cluster candidates
+    merged_candidates = []
+    # add raw table boxes (without score)
+    merged_candidates.extend([ (b[0],b[1],b[2],b[3]) for b in table_boxes ])
+    # add clusters
+    merged_candidates.extend(cluster_candidates)
+
+    # lastly, structural proposals fallback
+    structural = propose_structural_candidates(image, proto_features, debug=debug)
+    for s in structural:
+        if s not in merged_candidates:
+            merged_candidates.append(s)
+
+    # if still empty, fallback to the largest YOLO detection area (if any)
+    if len(merged_candidates)==0 and len(proposals)>0:
+        sorted_by_area = sorted(proposals, key=lambda p: (p[2]-p[0])*(p[3]-p[1]), reverse=True)
+        merged_candidates.append(tuple(sorted_by_area[0][:4]))
+
+    # merge overlapping candidates (IoU merging)
+    merged_candidates = merge_boxes_iou(merged_candidates, iou_thresh=0.15)
+
+    # Score each candidate
+    scored=[]
+    for idx, (x1,y1,x2,y2) in enumerate(merged_candidates):
+        crop = image[y1:y2, x1:x2]
+        ch,cw = crop.shape[:2]
+        if ch<4 or cw<4: continue
+
+        # header detection
+        header = detect_header_by_projection(crop, debug=debug)
+        if header is None:
+            continue
+        hx1,hy1,hx2,hy2 = header
+        header_abs = (x1+hx1, y1+hy1, x1+hx2, y1+hy2)
+        header_h = hy2-hy1
+
+        # rows by structure (works for SAP even without text)
+        
+        expected_h = proto_features["median_row_height"]
+        rows = detect_rows_by_structure(crop, header_end_rel=hy2, debug=debug)
+
+        rows = [
+            r for r in rows
+            if abs((r[1] - r[0]) - expected_h) < 0.5 * expected_h
         ]
+        nrows = len(rows)
 
-        # -------------------------
-        # Column detection
-        # -------------------------
-        col_peaks = detect_column_peaks(crop, debug=debug)
-        columns_abs = [x1 + px for px in col_peaks]
+        # columns by consistency
+        expected_w = proto_features["median_col_width"]
+        cols = detect_columns_by_consistency(crop, debug=debug)
 
-        nrows = len(rows_abs)
-        ncols = len(col_peaks)
+        cols = [
+            c for c in cols
+            if abs((c[1] - c[0]) - expected_w) < 0.6 * expected_w
+        ]
+        ncols = len(cols)
+        # cells count intersection of detected cells (if any proposals present)
+        # count how many proposal cell boxes fall in this candidate
+        cell_count = sum(1 for cb in cell_boxes if cb[0]>=x1 and cb[2]<=x2 and cb[1]>=y1 and cb[3]<=y2)
 
-        # -------------------------
-        # Minimal validity rules
-        # -------------------------
-        min_rows = 1 if mode == "SAP" else 2
-        if nrows < min_rows:
-            if debug:
-                print(
-                    f"[detector] candidate {idx} rejected: too few rows ({nrows})"
-                )
-            continue
-
-        if mode == "SAP" and ncols < 2:
-            if debug:
-                print(
-                    f"[detector] candidate {idx} rejected: too few columns ({ncols})"
-                )
-            continue
-
-        height = y2 - y1
-        width = x2 - x1
-
-        if mode == "SAP" and height < img_h * 0.05:
-            if debug:
-                print(
-                    f"[detector] candidate {idx} rejected: extremely small height"
-                )
-            continue
-
-        # ------------------------------------------------------------
-        # 4. Scoring (SAP-biased toward structure)
-        # ------------------------------------------------------------
-        height_ratio = height / img_h
-        width_ratio = width / img_w
-        header_ratio = (hy2 - hy1) / max(1, height)
-
+        # scoring: favor many cells/rows/cols, favor width and height reasonable, penalize bottom
         score = 0.0
+        score += cell_count * 4.0
+        score += nrows * 3.0
+        score += ncols * 2.0
+        score += ( (x2-x1)/w ) * 4.0
+        score += min(0.2, header_h/max(1,ch)) * 8.0
 
-        # structure is king for SAP
-        score += ncols * (3.0 if mode == "SAP" else 1.5)
-        score += nrows * 2.0
+        # penalties
+        height_ratio = ch/h
+        if height_ratio < 0.045:
+            score -= (0.05 - height_ratio) * 50.0
+        bottom_pen = max(0.0, (y2)/h - 0.8)
+        score -= bottom_pen * 60.0
 
-        # prefer wide tables
-        score += width_ratio * 5.0
-
-        # penalize bottom UI bars
-        bottom_penalty = max(0.0, (y2 / img_h) - 0.75)
-        score -= bottom_penalty * 10.0
-
-        # header must exist but not dominate
-        score += min(header_ratio, 0.25) * 4.0
-
-        candidates.append({
-            "bbox": (x1, y1, x2, y2),
-            "header": header_abs,
-            "rows": rows_abs,
-            "columns": columns_abs,
-            "score": score,
-            "index": idx
-        })
+        # slight penalty if header occupies too much of crop -> probably small crop
+        if header_h / max(1,ch) > 0.3:
+            score -= 12.0
 
         if debug:
-            base = os.path.join(DEBUG_DIR, f"cand_{idx}_score_{score:.2f}")
-            cv2.imwrite(base + ".png", crop)
-            with open(base + ".txt", "w") as f:
-                f.write(f"mode: {mode}\n")
+            fn = os.path.join(DEBUG_DIR, f"cand_all_{idx}_score_{score:.2f}.png")
+            cv2.imwrite(fn, crop)
+            with open(fn.replace(".png",".txt"), "w") as f:
                 f.write(f"bbox: {(x1,y1,x2,y2)}\n")
+                f.write(f"cell_count: {cell_count}\n")
                 f.write(f"nrows: {nrows}\n")
                 f.write(f"ncols: {ncols}\n")
                 f.write(f"height_ratio: {height_ratio:.3f}\n")
-                f.write(f"width_ratio: {width_ratio:.3f}\n")
-                f.write(f"header_ratio: {header_ratio:.3f}\n")
+                f.write(f"bottom_pen: {bottom_pen:.3f}\n")
                 f.write(f"score: {score:.3f}\n")
 
-    # ------------------------------------------------------------
-    # 5. Select best candidate
-    # ------------------------------------------------------------
-    if not candidates:
-        raise RuntimeError("No valid table found after candidate validation")
+        scored.append(((x1,y1,x2,y2), header_abs, rows, cols, score))
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    best = candidates[0]
+    if not scored:
+        raise RuntimeError("No valid table found after proposals")
 
-    if debug:
-        print(
-            f"[detector] selected candidate {best['index']} "
-            f"with score {best['score']:.2f}"
-        )
+    # pick best
+    scored.sort(key=lambda x: x[4], reverse=True)
+    best = scored[0]
+    table_bbox, header_abs, rows, cols, best_score = best
 
-    return best["bbox"], best["header"], best["rows"], best["columns"]
+    # convert rows_rel (relative to crop) to absolute rows_abs
+    rows_abs = [ (table_bbox[1] + r0, table_bbox[1] + r1) for (r0,r1) in rows ]
+    columns_abs = [ (table_bbox[0] + c0, table_bbox[0] + c1) for (c0,c1) in cols ]
+
+    return table_bbox, header_abs, rows_abs, columns_abs
