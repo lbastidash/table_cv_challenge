@@ -12,6 +12,7 @@ from structural_proposals import generate_structural_candidates
 
 MODEL_PATH = "models/table-detection-and-extraction.pt"
 
+
 # src/detector.py
 DEBUG_DIR = "debug_candidates"
 
