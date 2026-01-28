@@ -11,70 +11,12 @@ from structural_proposals import (
 )
 
 MODEL_PATH = "models/table-detection-and-extraction.pt"
-CONF_DEFAULT = 0.30
+# confidence (float): Confidence threshold for detection
+# iou_threshold (float): IoU threshold for NMS
+
+CONF_DEFAULT = 0.40
 IOU_DEFAULT = 0.45
 DEBUG_DIR = "debug_candidates"
-
-
-# ---------------------------
-# IoU helpers
-# ---------------------------
-def box_iou(boxA, boxB):
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-
-    interW = max(0, xB - xA)
-    interH = max(0, yB - yA)
-    interArea = interW * interH
-
-    areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-
-    if min(areaA, areaB) == 0:
-        return 0.0
-    return interArea / min(areaA, areaB)
-
-
-def merge_boxes_iou(boxes, iou_thresh=0.15):
-    merged = []
-    for b in boxes:
-        added = False
-        for i, m in enumerate(merged):
-            if box_iou(b, m) > iou_thresh:
-                merged[i] = (
-                    min(b[0], m[0]),
-                    min(b[1], m[1]),
-                    max(b[2], m[2]),
-                    max(b[3], m[3]),
-                )
-                added = True
-                break
-        if not added:
-            merged.append(b)
-    return merged
-
-
-# ---------------------------
-# BBox expansion
-# ---------------------------
-def expand_bbox(bbox, image_shape, pad_x_rel=0.02, pad_y_rel=0.04):
-    h, w = image_shape[:2]
-    x1, y1, x2, y2 = bbox
-    bw = x2 - x1
-    bh = y2 - y1
-
-    pad_x = int(bw * pad_x_rel)
-    pad_y = int(bh * pad_y_rel)
-
-    nx1 = max(0, x1 - pad_x)
-    ny1 = max(0, y1 - pad_y)
-    nx2 = min(w, x2 + pad_x)
-    ny2 = min(h, y2 + pad_y)
-
-    return (nx1, ny1, nx2, ny2)
-
 
 # ---------------------------
 # YOLO proposals (multi-scale + sliding)
@@ -83,7 +25,7 @@ def yolo_propose_many(model, image, conf, iou, mode="WEB", debug=False):
     h, w = image.shape[:2]
     proposals = []
 
-    scales = [1.0, 0.75, 1.25]
+    scales = [1, 0.75, 1.25, 0.25]
     for s in scales:
         res = model.predict(
             image,
@@ -109,9 +51,9 @@ def yolo_propose_many(model, image, conf, iou, mode="WEB", debug=False):
                 continue
 
             if mode == "SAP":
-                pad_x, pad_y = 0.06, 0.10
+                pad_x, pad_y = 0.1, 0.10
             else:
-                pad_x, pad_y = 0.03, 0.06
+                pad_x, pad_y = 0.0000001, 0.1
 
             nx1, ny1, nx2, ny2 = expand_bbox(
                 (x1, y1, x2, y2), image.shape, pad_x, pad_y
@@ -125,8 +67,8 @@ def yolo_propose_many(model, image, conf, iou, mode="WEB", debug=False):
             win = int(min(h, w) * 0.4)
             stride = int(win * 0.33)
         else:
-            win = int(min(h, w) * 0.5)
-            stride = int(win * 0.5)
+            win = int(min(h, w) * 0.3)
+            stride = int(win * 0.2)
 
         for y in range(0, h - win + 1, stride):
             for x in range(0, w - win + 1, stride):
@@ -170,7 +112,7 @@ def yolo_propose_many(model, image, conf, iou, mode="WEB", debug=False):
     for p in proposals:
         keep = True
         for i, q in enumerate(final):
-            if box_iou(p[:4], q[:4]) > 0.9:
+            if box_overlap(p[:4], q[:4]) > 0.9:
                 if p[5] > q[5]:
                     final[i] = p
                 keep = False
@@ -179,6 +121,76 @@ def yolo_propose_many(model, image, conf, iou, mode="WEB", debug=False):
             final.append(p)
 
     return final
+
+# ---------------------------
+# Box overlap
+# ---------------------------
+def box_overlap(boxA, boxB):
+    """
+    Calculate the percentage overlap between two boxes.
+    
+    Args:
+        boxA: First bounding box coordinates
+        boxB: Second bounding box coordinates
+            
+    Returns:
+        Percentage of overlap between the boxes
+    """
+    x_left = max(boxA[0], boxB[0])
+    y_top = max(boxA[1], boxB[1])
+    x_right = min(boxA[2], boxB[2])
+    y_bottom = min(boxA[3], boxB[3])
+
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+    boxA_area = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxB_area = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+
+    min_area = min(boxA_area, boxB_area)
+    if min_area == 0:
+        return 0.0
+            
+    return (intersection_area / min_area)
+
+
+def merge_boxes_iou(boxes, iou_thresh=0.10):
+    merged = []
+    for b in boxes:
+        added = False
+        for i, m in enumerate(merged):
+            if box_overlap(b, m) > iou_thresh:
+                merged[i] = (
+                    min(b[0], m[0]),
+                    min(b[1], m[1]),
+                    max(b[2], m[2]),
+                    max(b[3], m[3]),
+                )
+                added = True
+                break
+        if not added:
+            merged.append(b)
+    return merged
+# ---------------------------
+# BBox expansion
+# ---------------------------
+def expand_bbox(bbox, image_shape, pad_x_rel=0.02, pad_y_rel=0.04):
+    h, w = image_shape[:2]
+    x1, y1, x2, y2 = bbox
+    bw = x2 - x1
+    bh = y2 - y1
+
+    pad_x = int(bw * pad_x_rel)
+    pad_y = int(bh * pad_y_rel)
+
+    nx1 = max(0, x1 - pad_x)
+    ny1 = max(0, y1 - pad_y)
+    nx2 = min(w, x2 + pad_x)
+    ny2 = min(h, y2 + pad_y)
+
+    return (nx1, ny1, nx2, ny2)
+
 
 
 # ---------------------------
@@ -215,8 +227,6 @@ def merge_vertical_tables(cands, debug=False):
             merged.append(c)
 
     return merged
-
-
 # ---------------------------
 # MAIN entry
 # ---------------------------
@@ -270,3 +280,5 @@ def detect_table_and_header(image, proto_features, conf=CONF_DEFAULT, iou=IOU_DE
     cols_abs = [(best["bbox"][0] + c0, best["bbox"][0] + c1) for c0, c1 in best["cols"]]
 
     return best["bbox"], best["header"], rows_abs, cols_abs
+
+

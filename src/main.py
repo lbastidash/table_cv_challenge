@@ -2,6 +2,7 @@
 import sys
 import cv2
 import os
+import json 
 
 from prototype import extract_prototype_features
 from detector import detect_table_and_header
@@ -23,13 +24,29 @@ def main(screenshot_path, prototype_path, output_path="output.png", debug=False)
         screenshot, proto_features, debug=debug
     )
 
-    # imprimir resultados en stdout (requerido)
+    # Dictionary to save results
+    data_to_save = {
+        "table_boundaries": table_bbox,
+        "header_boundaries": header_bbox,
+        "rows": rows_abs,
+        "columns": columns_abs
+    }
+
+    # imprimir resultados en stdout
     print(f"Table boundaries: {table_bbox}")
     print(f"Header boundaries: {header_bbox}")
     for i, r in enumerate(rows_abs):
         print(f"Row {i}: {r}")
     for i, c in enumerate(columns_abs):
         print(f"Column {i}: {c}")
+
+    # 3. Guarda el archivo .json
+    # Usamos 'indent=4' para que el archivo sea legible para humanos
+    with open('results.json', 'w', encoding='utf-8') as f:
+        json.dump(data_to_save, f, indent=4, ensure_ascii=False, default=int)
+
+    print("\nFile 'results.json' saved successfully.")
+
 
     # dibujar y guardar
     out = draw_results(

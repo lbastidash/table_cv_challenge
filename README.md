@@ -68,14 +68,14 @@ If you plan to use GPU acceleration, install the CUDA-enabled version recommende
 From the root directory, execute:
 
 ```bash
-python src/main.py <screenshot_image> <prototype_image> --debug
+python src/main.py <screenshot_image> <prototype_image>
 ```
 
 
 ### Run
 
 ```bash
-python src/main.py /path/to/screenshot.png /path/to/prototype.png --debug
+python src/main.py /path/to/screenshot.png /path/to/prototype.png
 ```
 
 ### Expected output
